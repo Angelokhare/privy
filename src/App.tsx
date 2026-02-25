@@ -1,5 +1,5 @@
 import "./App.css";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { PrivyProvider, usePrivy } from "@privy-io/react-auth";
 import {
   useWallets,
@@ -30,8 +30,6 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 const PRIVY_APP_ID: string =
   (import.meta as any).env?.VITE_PRIVY_APP_ID ?? "cmm18czvp00y00cjuiovt9ukn";
-
-  
 
 const RPC_URL =
   "https://solana-mainnet.g.alchemy.com/v2/nRR5_ECTUtjWlB8iSu59C";
@@ -71,7 +69,6 @@ interface WalletToken {
   balance: number;
   decimals: number;
   symbol: string;
-  /** Which on-chain program owns this mint — Token or Token-2022 */
   tokenProgramId: PublicKey;
 }
 
@@ -129,11 +126,6 @@ function parsePaste(text: string, defaultAmount: string): BulkRecipient[] {
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Resolve the token program ID for a given mint address.
-// Checks the mint account owner on-chain: if it's Token-2022, returns
-// TOKEN_2022_PROGRAM_ID; otherwise falls back to TOKEN_PROGRAM_ID.
-// ─────────────────────────────────────────────────────────────────────────────
 async function resolveTokenProgramId(
   conn: Connection,
   mintAddress: string
@@ -178,6 +170,21 @@ function InnerApp() {
   const [pasteText, setPasteText] = useState("");
   const [pasteDefaultAmount, setPasteDefaultAmount] = useState("");
 
+  // ── Cross-tab tracking ──────────────────────────────────────────────────
+  const [activeTabs, setActiveTabs] = useState(1);
+
+  const MAX_AUTO_RETRIES = 5;
+  const autoRetryCountRef = useRef(0);
+  const bulkChannelRef = useRef<BroadcastChannel | null>(null);
+  const handleBulkRef = useRef<(() => void) | null>(null);
+  const isAutoRetryRef = useRef(false);
+
+  // ── KEY FIX: rowsRef always holds latest rows so handleBulk never reads stale closure ──
+  const rowsRef = useRef(rows);
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
+
   // ── Balance polling ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!wallet?.address) return;
@@ -192,7 +199,92 @@ function InnerApp() {
     return () => clearInterval(t);
   }, [wallet?.address]);
 
-  // ── Auto-detect SPL tokens (TOKEN_PROGRAM_ID + TOKEN_2022_PROGRAM_ID) ────
+  // ─────────────────────────────────────────────────────────────────────────
+  // CROSS-TAB COORDINATION via BroadcastChannel
+  // Supports:
+  //   RETRY_BULK   — triggers auto-retry on all listening tabs
+  //   TAB_PING     — a tab announces it is alive (sent on mount + heartbeat)
+  //   TAB_PONG     — a tab replies to a ping so the sender can count tabs
+  //   TAB_CLOSE    — a tab is about to unload
+  // ─────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const tabId = uid(); // unique id for this tab instance
+    const ch = new BroadcastChannel("solsend_bulk_retry");
+    bulkChannelRef.current = ch;
+
+    // Track pong replies within a collection window
+    const pongSet = new Set<string>();
+    let pongTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const collectAndCount = () => {
+      // +1 for self
+      setActiveTabs(pongSet.size + 1);
+    };
+
+    const broadcastPing = () => {
+      pongSet.clear();
+      ch.postMessage({ type: "TAB_PING", from: tabId });
+      if (pongTimer) clearTimeout(pongTimer);
+      pongTimer = setTimeout(collectAndCount, 400); // wait 400 ms for pongs
+    };
+
+    ch.onmessage = (e) => {
+      const data = e.data;
+      if (!data?.type) return;
+
+      switch (data.type) {
+        case "TAB_PING":
+          // Someone pinged — reply so they can count us
+          ch.postMessage({ type: "TAB_PONG", from: tabId, to: data.from });
+          break;
+
+        case "TAB_PONG":
+          // Only count pongs directed to us or broadcast pongs
+          if (!data.to || data.to === tabId) {
+            pongSet.add(data.from as string);
+          }
+          break;
+
+        case "TAB_CLOSE":
+          // Another tab closed; re-ping to refresh count
+          broadcastPing();
+          break;
+
+        case "RETRY_BULK":
+          // Another tab errored and triggered auto-retry — mirror it here
+          // We use setTimeout so React state from the triggering tab's
+          // setBulkRunning(false) has time to settle before we start again.
+          setTimeout(() => {
+            autoRetryCountRef.current = data.retryCount ?? autoRetryCountRef.current + 1;
+            isAutoRetryRef.current = true;
+            handleBulkRef.current?.();
+          }, 200);
+          break;
+      }
+    };
+
+    // Announce presence on mount and start heartbeat
+    broadcastPing();
+    const heartbeat = setInterval(broadcastPing, 8_000);
+
+    // Announce departure on unload
+    const handleUnload = () => {
+      ch.postMessage({ type: "TAB_CLOSE", from: tabId });
+      ch.close();
+    };
+    window.addEventListener("beforeunload", handleUnload);
+
+    return () => {
+      clearInterval(heartbeat);
+      if (pongTimer) clearTimeout(pongTimer);
+      window.removeEventListener("beforeunload", handleUnload);
+      ch.postMessage({ type: "TAB_CLOSE", from: tabId });
+      ch.close();
+      bulkChannelRef.current = null;
+    };
+  }, []);
+
+  // ── Auto-detect SPL tokens ────────────────────────────────────────────────
   useEffect(() => {
     if (!wallet?.address) return;
     const fetchTokens = async () => {
@@ -200,7 +292,6 @@ function InnerApp() {
       try {
         const owner = new PublicKey(wallet.address);
 
-        // ── Query BOTH token programs in parallel ──────────────────────
         const [legacyResult, t22Result] = await Promise.allSettled([
           connection.getParsedTokenAccountsByOwner(owner, {
             programId: TOKEN_PROGRAM_ID,
@@ -226,7 +317,6 @@ function InnerApp() {
           );
         }
 
-        // ── Map helper ─────────────────────────────────────────────────
         const mapAccounts = (
           accounts: typeof legacyAccounts,
           programId: PublicKey
@@ -245,9 +335,6 @@ function InnerApp() {
                 tokenProgramId: programId,
               };
             })
-            // Show tokens with any non-zero balance; Token-2022 tokens
-            // sometimes report uiAmount=null even when they have a balance,
-            // so we also keep rows where rawAmount > 0.
             .filter((t) => {
               if (t.balance > 0) return true;
               const rawAmt = accounts.find(
@@ -261,7 +348,6 @@ function InnerApp() {
           ...mapAccounts(t22Accounts, TOKEN_2022_PROGRAM_ID),
         ];
 
-        // Deduplicate by mint (shouldn't happen but guard anyway)
         const seen = new Set<string>();
         const tokens = combined.filter((t) => {
           if (seen.has(t.mint)) return false;
@@ -270,7 +356,11 @@ function InnerApp() {
         });
 
         setWalletTokens(tokens);
-        if (tokens.length > 0 && !mintAddr) setMintAddr(tokens[0].mint);
+
+        setMintAddr((prev) => {
+          if (!prev && tokens.length > 0) return tokens[0].mint;
+          return prev;
+        });
       } catch (e) {
         console.warn("Could not fetch wallet tokens:", e);
       } finally {
@@ -355,7 +445,7 @@ function InnerApp() {
 
           if (isRateLimit && attempt < MAX_ATTEMPTS) {
             console.warn(
-              `[SolSend] 429 — waiting ${RATE_LIMIT_WINDOW_MS / 1000}s for rate limit window to reset (attempt ${attempt}/${MAX_ATTEMPTS})`
+              `[SolSend] 429 — waiting ${RATE_LIMIT_WINDOW_MS / 1000}s (attempt ${attempt}/${MAX_ATTEMPTS})`
             );
             await new Promise((r) => setTimeout(r, RATE_LIMIT_WINDOW_MS));
             continue;
@@ -506,7 +596,7 @@ function InnerApp() {
   );
 
   // ─────────────────────────────────────────────────────────────────────────
-  // SPL single transfer — supports both Token and Token-2022
+  // SPL single transfer
   // ─────────────────────────────────────────────────────────────────────────
   const sendSPL = useCallback(
     async (to: string, mint: string, raw: number): Promise<string> => {
@@ -520,7 +610,6 @@ function InnerApp() {
       }
       const from = new PublicKey(wallet.address);
 
-      // ── Resolve token program (Token or Token-2022) ──────────────────
       const cached = walletTokens.find((t) => t.mint === mint);
       const tokenProgram: PublicKey =
         cached?.tokenProgramId ??
@@ -584,7 +673,7 @@ function InnerApp() {
   );
 
   // ─────────────────────────────────────────────────────────────────────────
-  // TWO-PHASE PREFLIGHT — supports both Token and Token-2022
+  // TWO-PHASE PREFLIGHT
   // ─────────────────────────────────────────────────────────────────────────
   const buildTwoPhaseIxBatches = useCallback(
     async (validRows: BulkRecipient[], mint: string) => {
@@ -592,7 +681,6 @@ function InnerApp() {
       const mintPk = new PublicKey(mint);
       const from = new PublicKey(wallet.address);
 
-      // ── Resolve token program (Token or Token-2022) ──────────────────
       const cached = walletTokens.find((t) => t.mint === mint);
       const tokenProgram: PublicKey =
         cached?.tokenProgramId ??
@@ -676,6 +764,54 @@ function InnerApp() {
   );
 
   // ─────────────────────────────────────────────────────────────────────────
+  // AUTO-RETRY HELPER
+  // Resets errored rows to idle, broadcasts to all tabs, then fires after a
+  // short delay so React has time to flush the state update before the next
+  // handleBulk run reads rowsRef.current.
+  // ─────────────────────────────────────────────────────────────────────────
+  const triggerAutoRetry = useCallback(
+    (errMsg: string, allIds: Set<string>) => {
+      if (autoRetryCountRef.current >= MAX_AUTO_RETRIES) {
+        setPhaseMsg(
+          `❌ Failed after ${MAX_AUTO_RETRIES} attempts. Please retry manually.`
+        );
+        setBulkRunning(false);
+        return;
+      }
+
+      autoRetryCountRef.current += 1;
+      const attempt = autoRetryCountRef.current;
+
+      // Reset errored rows → idle so the next run picks them up fresh
+      setRows((p) =>
+        p.map((x) =>
+          allIds.has(x.id) && x.status === "error"
+            ? { ...x, status: "idle", error: undefined }
+            : x
+        )
+      );
+
+      setPhaseMsg(
+        `⚠️ Error — auto-retrying… (attempt ${attempt}/${MAX_AUTO_RETRIES})`
+      );
+      setBulkRunning(false);
+
+      // Broadcast to all other tabs so they retry in sync
+      bulkChannelRef.current?.postMessage({
+        type: "RETRY_BULK",
+        retryCount: attempt,
+      });
+
+      // Delay lets React flush setRows + setBulkRunning before we re-enter
+      setTimeout(() => {
+        isAutoRetryRef.current = true;
+        handleBulkRef.current?.();
+      }, 250);
+    },
+    [] // stable — only touches refs and setters
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
   // SINGLE TRANSFER
   // ─────────────────────────────────────────────────────────────────────────
   const handleSingle = async () => {
@@ -703,17 +839,38 @@ function InnerApp() {
 
   // ─────────────────────────────────────────────────────────────────────────
   // BULK TRANSFER
+  // KEY FIX: read rows from rowsRef.current (always latest) instead of the
+  // stale closure copy that useCallback would have captured.
   // ─────────────────────────────────────────────────────────────────────────
-  const handleBulk = async () => {
+  const handleBulk = useCallback(async () => {
+    // Guard: don't start a second run if one is already in flight
+    if (bulkRunning) return;
+
     setBulkRunning(true);
     setProgress(0);
+
+    // Only reset the retry counter when the user manually clicks Send
+    if (!isAutoRetryRef.current) autoRetryCountRef.current = 0;
+    isAutoRetryRef.current = false;
+
     setBulkPhase("preflight");
     setPhaseMsg("Scanning recipient accounts…");
-    const valid = rows.filter((r) => r.address && r.amount);
+
+    // ── KEY FIX: read from ref, not stale closure ──
+    const currentRows = rowsRef.current;
+    const valid = currentRows.filter((r) => r.address && r.amount && r.status !== "success");
     const allIds = new Set(valid.map((r) => r.id));
+
     setRows((p) =>
       p.map((x) => (allIds.has(x.id) ? { ...x, status: "pending" } : x))
     );
+
+    if (valid.length === 0) {
+      setPhaseMsg("Nothing to send.");
+      setBulkPhase("idle");
+      setBulkRunning(false);
+      return;
+    }
 
     if (tokenType === "SOL") {
       const batches = chunk(valid, BATCH_SIZE_SOL);
@@ -736,9 +893,7 @@ function InnerApp() {
                   : x
               )
             );
-            setProgress(
-              Math.round(((batchIdx + 1) / batches.length) * 100)
-            );
+            setProgress(Math.round(((batchIdx + 1) / batches.length) * 100));
           },
           (confirmed, total) => {
             setPhaseMsg(`Confirming ${confirmed}/${total} transactions…`);
@@ -754,8 +909,7 @@ function InnerApp() {
           )
         );
         setBulkPhase("idle");
-        setPhaseMsg("");
-        setBulkRunning(false);
+        triggerAutoRetry(errMsg, allIds);
         return;
       }
       setBulkPhase("done");
@@ -764,6 +918,7 @@ function InnerApp() {
       return;
     }
 
+    // ── SPL path ─────────────────────────────────────────────────────────
     try {
       const { ataIxBatches, transferIxBatches, missingAtaCount } =
         await buildTwoPhaseIxBatches(valid, mintAddr);
@@ -849,10 +1004,26 @@ function InnerApp() {
         )
       );
       setBulkPhase("idle");
-      setPhaseMsg("");
+      triggerAutoRetry(errMsg, allIds);
+      return;
     }
     setBulkRunning(false);
-  };
+  }, [
+    bulkRunning,
+    tokenType,
+    mintAddr,
+    sendAllTxs,
+    buildSOLBatchIxs,
+    buildTwoPhaseIxBatches,
+    triggerAutoRetry,
+    // rowsRef and isAutoRetryRef/autoRetryCountRef are refs — no need to list
+  ]);
+
+  // Keep ref in sync so BroadcastChannel listener and setTimeout can always
+  // call the very latest version of handleBulk
+  useEffect(() => {
+    handleBulkRef.current = handleBulk;
+  }, [handleBulk]);
 
   // ── Row helpers ───────────────────────────────────────────────────────────
   const addRow = () =>
@@ -929,6 +1100,25 @@ function InnerApp() {
               <span className="wallet-type">
                 {isEmbedded ? "⚡ Embedded" : wallet.walletClientType}
               </span>
+              {/* Cross-tab tracker */}
+              {activeTabs > 1 && (
+                <span
+                  title={`${activeTabs} tabs open — all will auto-retry on error`}
+                  style={{
+                    marginLeft: 6,
+                    fontSize: 11,
+                    background: "rgba(20,241,149,0.15)",
+                    color: "#14F195",
+                    border: "1px solid rgba(20,241,149,0.3)",
+                    borderRadius: 6,
+                    padding: "1px 7px",
+                    fontWeight: 600,
+                    cursor: "default",
+                  }}
+                >
+                  🗂 {activeTabs} tabs
+                </span>
+              )}
             </div>
             <button className="btn-ghost" onClick={logout}>
               Disconnect
@@ -970,6 +1160,12 @@ function InnerApp() {
                 <div className="status-msg">
                   Embedded wallet — gas fully sponsored. Bulk sends run
                   automatically with <strong>zero approval dialogs</strong>.
+                  {activeTabs > 1 && (
+                    <span style={{ color: "#14F195" }}>
+                      {" "}
+                      · {activeTabs} tabs synced — all auto-retry on error.
+                    </span>
+                  )}
                 </div>
               </div>
             ) : (
@@ -1206,6 +1402,15 @@ function InnerApp() {
                     {errorCount > 0 && (
                       <span className="stat stat-error">✗ {errorCount}</span>
                     )}
+                    {activeTabs > 1 && (
+                      <span
+                        className="stat"
+                        style={{ color: "#14F195" }}
+                        title="All tabs auto-retry in sync when any tab errors"
+                      >
+                        🗂 {activeTabs} tabs synced
+                      </span>
+                    )}
                   </div>
                   <div className="bulk-actions">
                     <button
@@ -1352,12 +1557,14 @@ function InnerApp() {
                   CSV format: address,amount — one per line, max 100 rows
                 </div>
 
-                {bulkRunning && phaseMsg && (
+                {phaseMsg && (
                   <div
-                    className="status-card status-loading"
+                    className={`status-card ${
+                      bulkRunning ? "status-loading" : "status-error"
+                    }`}
                     style={{ marginBottom: 10 }}
                   >
-                    <span className="spinner-sm" />
+                    {bulkRunning && <span className="spinner-sm" />}
                     <div className="status-msg">{phaseMsg}</div>
                   </div>
                 )}
@@ -1497,7 +1704,10 @@ function InnerApp() {
 
                 <button
                   className="btn-primary send-btn"
-                  onClick={handleBulk}
+                  onClick={() => {
+                    isAutoRetryRef.current = false;
+                    handleBulk();
+                  }}
                   disabled={
                     bulkRunning ||
                     validCount === 0 ||
