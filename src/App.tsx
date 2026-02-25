@@ -29,7 +29,7 @@ import {
 // CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 const PRIVY_APP_ID: string =
-  (import.meta as any).env?.VITE_PRIVY_APP_ID ?? "cmm1gbs2300qj0cjiz3ewb3ys";
+  (import.meta as any).env?.VITE_PRIVY_APP_ID ?? "cmm18czvp00y00cjuiovt9ukn";
 
 const RPC_URL =
   "https://solana-mainnet.g.alchemy.com/v2/nRR5_ECTUtjWlB8iSu59C";
